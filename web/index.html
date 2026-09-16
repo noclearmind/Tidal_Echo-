@@ -5715,6 +5715,564 @@ if ("serviceWorker" in navigator){
 }
 
 init();
+  /* Tidal Echo：浏览器直连模式 v1
+ * 替换原来的 init();，保留其后的 </script> 等标签。
+ */
+(function directChatMode() {
+  "use strict";
+
+  const CONFIG_KEY = "tidal_direct_config_v1";
+  const HISTORY_KEY = "tidal_direct_history_v1";
+  let busy = false;
+  let apiKey = "";
+  let records = [];
+
+  const defaults = {
+    base: "https://api.only-ai.win",
+    protocol: "openai",
+    model: "",
+    system: "",
+    maxTokens: 4096
+  };
+
+  function readJSON(key, fallback) {
+    try {
+      return JSON.parse(localStorage.getItem(key)) || fallback;
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  let config = {
+    ...defaults,
+    ...readJSON(CONFIG_KEY, {})
+  };
+
+  const savedRecords = readJSON(HISTORY_KEY, []);
+  if (Array.isArray(savedRecords)) {
+    records = savedRecords.filter(m =>
+      m && Number.isSafeInteger(m.id) &&
+      (m.from === "human" || m.from === "ai") &&
+      typeof m.text === "string"
+    );
+  }
+
+  let nextId = Math.max(
+    Date.now(),
+    ...records.map(m => m.id)
+  );
+
+  // 停用原 Relay 登录、后台补拉和连接流程。
+  secret = null;
+  activeApiSession = LEGACY_SESSION_ID;
+  apiSessions = [];
+
+  refreshContextStatus = async function () {};
+  backfill = function () {};
+  openStream = function () {};
+
+  // 隐藏尚未适配的原后端功能，避免产生无效操作。
+  [
+    "brainSeg", "brainHint", "modelSeg", "effortSeg",
+    "contextSlider", "resetRow", "swapRow", "resumeRow",
+    "sessionBtn", "sessionPop", "terminalBtn",
+    "clipBtn", "micBtn"
+  ].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.setProperty("display", "none", "important");
+  });
+
+  if (statusUsedEl) statusUsedEl.textContent = "用量：尚未请求";
+  if (statusSidEl) statusSidEl.textContent = "浏览器直连";
+
+  const style = document.createElement("style");
+  style.textContent = `
+    #td-open {
+      position:fixed; right:12px;
+      top:calc(env(safe-area-inset-top, 0px) + 12px);
+      z-index:10000; padding:8px 12px;
+      border:1px solid var(--hairline); border-radius:18px;
+      background:var(--field-bg); color:var(--text);
+      font-size:13px;
+    }
+    #td-dialog {
+      width:min(92vw,480px); max-height:85dvh;
+      overflow:auto; border:1px solid var(--hairline);
+      border-radius:18px; padding:20px;
+      background:var(--bg); color:var(--text);
+    }
+    #td-dialog::backdrop { background:rgba(0,0,0,.4); }
+    #td-dialog label {
+      display:block; margin:12px 0; font-size:14px;
+    }
+    #td-dialog input, #td-dialog select,
+    #td-dialog textarea {
+      display:block; width:100%; margin-top:5px;
+      padding:10px; border:1px solid var(--hairline);
+      border-radius:8px; background:var(--field-bg);
+      color:var(--text); font:inherit; font-size:16px;
+      box-sizing:border-box;
+    }
+    #td-dialog button {
+      margin:5px 5px 5px 0; padding:10px 13px;
+      border:1px solid var(--hairline); border-radius:9px;
+      background:var(--composer-bg); color:var(--text);
+    }
+    #td-note { white-space:pre-wrap; font-size:13px; }
+    #td-usage { font-size:13px; white-space:pre-wrap; }
+  `;
+  document.head.appendChild(style);
+
+  const openButton = document.createElement("button");
+  openButton.id = "td-open";
+  openButton.type = "button";
+  openButton.textContent = "接口 / 模型";
+  document.body.appendChild(openButton);
+
+  const dialog = document.createElement("dialog");
+  dialog.id = "td-dialog";
+  dialog.innerHTML = `
+    <strong>接口与模型</strong>
+    <label>中转站地址
+      <input id="td-base" type="url"
+        placeholder="https://api.only-ai.win">
+    </label>
+    <label>接口格式
+      <select id="td-protocol">
+        <option value="openai">OpenAI 兼容格式</option>
+        <option value="anthropic">Anthropic 原生格式</option>
+      </select>
+    </label>
+    <label>API Key（仅本次打开有效）
+      <input id="td-key" type="password" autocomplete="off">
+    </label>
+    <button id="td-models" type="button">获取模型列表</button>
+    <label>从列表选择模型
+      <select id="td-list">
+        <option value="">获取列表后在这里选择</option>
+      </select>
+    </label>
+    <label>当前模型（也可手动填写）
+      <input id="td-model" autocomplete="off"
+        placeholder="中转站提供的准确模型名称">
+    </label>
+    <label>固定人设 / 背景
+      <textarea id="td-system" rows="6"
+        placeholder="填写你希望长期保持的人设与背景"></textarea>
+    </label>
+    <label>单次回复最多输出 Token
+      <input id="td-max" type="number"
+        min="1" step="1" value="4096">
+    </label>
+    <p style="font-size:12px">
+      聊天与人设保存在当前浏览器，请定期导出。
+      OpenAI 格式由中转站决定缓存行为；
+      原生格式会发送缓存标记。
+    </p>
+    <p id="td-usage">缓存用量：尚未收到接口数据</p>
+    <p id="td-note" role="status"></p>
+    <button id="td-save" type="button">保存并聊天</button>
+    <button id="td-export" type="button">导出聊天</button>
+    <button id="td-new" type="button">清空并开始新对话</button>
+    <button id="td-close" type="button">关闭</button>
+  `;
+  document.body.appendChild(dialog);
+
+  const field = id => dialog.querySelector("#td-" + id);
+  const say = text => { field("note").textContent = text; };
+
+  function fillSettings() {
+    field("base").value = config.base;
+    field("protocol").value = config.protocol;
+    field("model").value = config.model;
+    field("system").value = config.system;
+    field("max").value = config.maxTokens;
+    field("key").value = apiKey;
+  }
+
+  function normalizeBase(value) {
+    const url = new URL(value.trim());
+    if (url.protocol !== "https:") {
+      throw new Error("请填写 https:// 开头的中转站地址。");
+    }
+    if (url.username || url.password || url.search || url.hash) {
+      throw new Error("地址里不要带密码、查询参数或 #。");
+    }
+    let path = url.pathname.replace(/\/+$/, "");
+    path = path.replace(/\/(chat\/completions|messages|models)$/, "");
+    if (!path) path = "/v1";
+    return url.origin + path;
+  }
+
+  function captureSettings(requireModel = true) {
+    const base = normalizeBase(field("base").value);
+    const key = field("key").value.trim();
+    const model = field("model").value.trim();
+    const maxTokens = Number(field("max").value);
+
+    if (!key) throw new Error("请填写 API Key。");
+    if (requireModel && !model) throw new Error("请选择或填写模型。");
+    if (!Number.isInteger(maxTokens) || maxTokens < 1) {
+      throw new Error("回复长度请填写大于 0 的整数。");
+    }
+
+    return {
+      key,
+      settings: {
+        base,
+        model,
+        protocol: field("protocol").value,
+        system: field("system").value,
+        maxTokens
+      }
+    };
+  }
+
+  async function request(settings, key, path, body) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 180000);
+    const headers = { "Content-Type": "application/json" };
+
+    if (settings.protocol === "anthropic") {
+      headers["x-api-key"] = key;
+      headers["anthropic-version"] = "2023-06-01";
+      headers["anthropic-dangerous-direct-browser-access"] = "true";
+    } else {
+      headers.Authorization = "Bearer " + key;
+    }
+
+    try {
+      const response = await fetch(settings.base + path, {
+        method: body ? "POST" : "GET",
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+        credentials: "omit",
+        cache:"no-store",
+        referrerPolicy: "no-referrer"
+      });
+
+      const raw = await response.text();
+      let data;
+      try {
+        data = JSON.parse(raw);
+      } catch (_) {
+        throw new Error(
+          `HTTP ${response.status}：没有返回 JSON，请核对接口地址。`
+        );
+      }
+
+      if (!response.ok) {
+        const detail = data.error?.message || data.message || "";
+        throw new Error(
+          `HTTP ${response.status}：${String(detail).slice(0, 500)}`
+        );
+      }
+      return data;
+    } catch (error) {
+      if (error.name === "AbortError") {
+        throw new Error("请求超过三分钟。未自动重试，请先查看中转站记录。");
+      }
+      if (error instanceof TypeError) {
+        throw new Error(
+          "浏览器未能连接接口：可能是网络、地址或跨域限制。" +
+          "如果中转站禁止网页跨域访问，需要增加代理。"
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  field("models").onclick = async () => {
+    const button = field("models");
+    button.disabled = true;
+    say("正在获取模型列表……");
+    try {
+      const { settings, key } = captureSettings(false);
+      const result = await request(settings, key, "/models");
+      const ids = [...new Set(
+        (Array.isArray(result.data) ? result.data : [])
+          .map(m => m.id)
+          .filter(id => typeof id === "string" && id)
+      )].sort();
+
+      const list = field("list");
+      list.replaceChildren(new Option("请选择模型", ""));
+      ids.forEach(id => list.add(new Option(id, id)));
+
+      say(ids.length
+        ? `获取到 ${ids.length} 个模型，请选择。`
+        : "接口没有返回模型列表，可以手动填写模型名称。");
+    } catch (error) {
+      say(error.message + "\n也可以直接手动填写模型名称。");
+    } finally {
+      button.disabled = false;
+    }
+  };
+
+  field("list").onchange = () => {
+    if (field("list").value) {
+      field("model").value = field("list").value;
+    }
+  };
+
+  field("save").onclick = () => {
+    if (busy) {
+      say("请等当前回复完成后再切换设置。");
+      return;
+    }
+    try {
+      const captured = captureSettings();
+      localStorage.setItem(
+        CONFIG_KEY, JSON.stringify(captured.settings)
+      );
+      config = captured.settings;
+      apiKey = captured.key;
+      field("key").value = "";
+      dialog.close();
+      statusEl.textContent = "已配置 · " + config.model;
+      showToast("设置已保存，可以发送消息");
+    } catch (error) {
+      say(error.message);
+    }
+  };
+
+  openButton.onclick = () => {
+    fillSettings();
+    say("");
+    dialog.showModal();
+  };
+  field("close").onclick = () => {
+    field("key").value = "";
+    dialog.close();
+  };
+      function persistHistory() {
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(records));
+      return true;
+    } catch (_) {
+      showToast("浏览器存储已满，请立即导出聊天");
+      return false;
+    }
+  }
+
+  field("export").onclick = () => {
+    const blob = new Blob([
+      JSON.stringify({
+        exportedAt: new Date().toISOString(),
+        model: config.model,
+        system: config.system,
+        messages: records
+      }, null, 2)
+    ], { type: "application/json" });
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "tidal-chat-" + Date.now() + ".json";
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    say("已发起下载，文件中不包含 API Key。");
+  };
+
+  field("new").onclick = () => {
+    if (busy) {
+      say("当前正在回复，请稍后操作。");
+      return;
+    }
+    if (!confirm("确定清空这份聊天吗？建议先导出备份。")) return;
+
+    try {
+      localStorage.setItem(HISTORY_KEY, "[]");
+    } catch (_) {
+      say("无法清空浏览器存储。");
+      return;
+    }
+    records = [];
+    startChat([], { connect: false });
+    hasMoreOlder = false;
+    statusEl.textContent = "新对话";
+    say("已清空聊天，人设和接口设置保留。");
+  };
+
+  function message(from, text) {
+    return {
+      id: ++nextId,
+      ts: new Date().toISOString(),
+      from,
+      kind: from === "human" ? "user" : "reply",
+      text,
+      meta: {},
+      status: "sent"
+    };
+  }
+
+  function showUsage(usage) {
+    const read = usage?.cache_read_input_tokens ??
+      usage?.prompt_tokens_details?.cached_tokens ??
+      usage?.input_tokens_details?.cached_tokens;
+
+    const created = usage?.cache_creation_input_tokens;
+    const input = usage?.prompt_tokens ?? usage?.input_tokens;
+    const output = usage?.completion_tokens ?? usage?.output_tokens;
+
+    const label = [
+      "输入 Token：" + (input ?? "未返回"),
+      "输出 Token：" + (output ?? "未返回"),
+      "缓存读取 Token：" + (read ?? "接口未返回"),
+      "缓存写入 Token：" + (created ?? "接口未返回")
+    ].join("\n");
+
+    field("usage").textContent = label;
+    if (statusUsedEl) {
+      statusUsedEl.textContent = read == null
+        ? "缓存读取：接口未返回"
+        : "缓存读取：" + read + " Token";
+    }
+  }
+      async function sendDirect() {
+    if (busy) return;
+    const text = inputEl.value.trim();
+    if (!text) return;
+
+    if (!apiKey || !config.model) {
+      fillSettings();
+      say("先填写 Key，并选择模型。原消息仍在输入框里。");
+      dialog.showModal();
+      return;
+    }
+
+    busy = true;
+    sendBtn.disabled = true;
+    const settings = { ...config };
+    const key = apiKey;
+    const human = message("human", text);
+    const conversation = records.concat(human).map(m => ({
+      role: m.from === "human" ? "user" : "assistant",
+      content: m.text
+    }));
+
+    inputEl.value = "";
+    inputEl.style.height = "auto";
+    onMessage(human);
+    statusEl.textContent = "正在回复……";
+
+    try {
+      let body;
+      let path;
+
+      if (settings.protocol === "anthropic") {
+        path = "/messages";
+
+        // 在对话末尾设置移动缓存点，保持已有前缀不变。
+        const messages = conversation.map((m, index) => ({
+          role: m.role,
+          content: [{
+            type: "text",
+            text: m.content,
+            ...(index === conversation.length - 1
+              ? { cache_control: { type: "ephemeral" } }
+              : {})
+          }]
+        }));
+
+        body = {
+          model: settings.model,
+          max_tokens: settings.maxTokens,
+          messages
+        };
+        if (settings.system) {
+          body.system = [{
+            type: "text",
+            text: settings.system,
+            cache_control: { type: "ephemeral" }
+          }];
+        }
+      } else {
+        path = "/chat/completions";
+        body = {
+          model: settings.model,
+          max_tokens: settings.maxTokens,
+          stream: false,
+          messages: [
+            ...(settings.system
+              ? [{ role: "system", content: settings.system }]
+              : []),
+            ...conversation
+          ]
+        };
+      }
+
+      const result = await request(settings, key, path, body);
+      showUsage(result.usage);
+
+      let reply;
+      if (settings.protocol === "anthropic") {
+        reply = (result.content || [])
+          .filter(block => block.type === "text")
+          .map(block => block.text)
+          .join("\n");
+      } else {
+        const content = result.choices?.[0]?.message?.content;
+        reply = typeof content === "string"
+          ? content
+          : Array.isArray(content)
+            ? content.filter(b => b.type === "text")
+                .map(b => b.text).join("\n")
+            : "";
+      }
+
+      if (!reply || !reply.trim()) {
+        throw new Error(
+          "接口没有返回文字回复。这版暂不处理工具调用或图片回复。"
+        );
+      }
+
+      const ai = message("ai", reply);
+      records.push(human, ai);
+      persistHistory();
+      onMessage(ai);
+      statusEl.textContent = "回复完成 · " + settings.model;
+    } catch (error) {
+      // 失败时不污染下一轮上下文，也不自动重试计费请求。
+      startChat(records, { connect: false });
+      hasMoreOlder = false;
+      inputEl.value = text;
+      statusEl.textContent = "请求失败";
+      fillSettings();
+      say(error.message + "\n你的消息已放回输入框，没有自动重试。");
+      if (!dialog.open) dialog.showModal();
+    } finally {
+      busy = false;
+      sendBtn.disabled = false;
+    }
+  }
+
+  // 捕获原发送事件，避免再走 Relay。
+  sendBtn.addEventListener("click", event => {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    sendDirect();
+  }, true);
+
+  inputEl.addEventListener("keydown", event => {
+    if (event.key === "Enter" &&
+        !event.shiftKey && !event.isComposing && !composing) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      sendDirect();
+    }
+  }, true);
+
+  startChat(records, { connect: false });
+  hasMoreOlder = false;
+  statusEl.textContent = "请配置接口";
+  fillSettings();
+  say("填好接口和 Key，再获取模型列表；也可以手动填写模型。");
+  dialog.showModal();
+})();
 </script>
 
 </body>
